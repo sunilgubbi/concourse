@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"sort"
 	"time"
 
 	"code.cloudfoundry.org/clock"
@@ -323,7 +325,8 @@ func (p *containerProvider) createGardenContainer(
 	spec ContainerSpec,
 	fetchedImage FetchedImage,
 ) (garden.Container, error) {
-	volumeMounts := []VolumeMount{}
+	var volumeMounts []VolumeMount
+	var ioVolumeMounts []VolumeMount
 
 	scratchVolume, err := p.volumeClient.FindOrCreateVolumeForContainer(
 		logger,
@@ -374,6 +377,8 @@ func (p *containerProvider) createGardenContainer(
 		p.clock,
 	)
 
+	inputDestinationPaths := make(map[string]bool)
+
 	for _, inputSource := range spec.Inputs {
 		var inputVolume Volume
 
@@ -381,6 +386,8 @@ func (p *containerProvider) createGardenContainer(
 		if err != nil {
 			return nil, err
 		}
+
+		inputPath := filepath.Clean(inputSource.DestinationPath())
 
 		if found {
 			inputVolume, err = p.volumeClient.FindOrCreateCOWVolumeForContainer(
@@ -392,7 +399,7 @@ func (p *containerProvider) createGardenContainer(
 				creatingContainer,
 				localVolume,
 				spec.TeamID,
-				inputSource.DestinationPath(),
+				inputPath,
 			)
 			if err != nil {
 				return nil, err
@@ -406,7 +413,7 @@ func (p *containerProvider) createGardenContainer(
 				},
 				creatingContainer,
 				spec.TeamID,
-				inputSource.DestinationPath(),
+				inputPath,
 			)
 			if err != nil {
 				return nil, err
@@ -418,13 +425,22 @@ func (p *containerProvider) createGardenContainer(
 			}
 		}
 
-		volumeMounts = append(volumeMounts, VolumeMount{
+		ioVolumeMounts = append(ioVolumeMounts, VolumeMount{
 			Volume:    inputVolume,
-			MountPath: inputSource.DestinationPath(),
+			MountPath: inputPath,
 		})
+
+		inputDestinationPaths[inputPath] = true
 	}
 
 	for _, outputPath := range spec.Outputs {
+		outPath := filepath.Clean(outputPath)
+
+		// reuse volume if output path is the same as input
+		if inputDestinationPaths[outPath] {
+			continue
+		}
+
 		outVolume, volumeErr := p.volumeClient.FindOrCreateVolumeForContainer(
 			logger,
 			VolumeSpec{
@@ -433,15 +449,15 @@ func (p *containerProvider) createGardenContainer(
 			},
 			creatingContainer,
 			spec.TeamID,
-			outputPath,
+			outPath,
 		)
 		if volumeErr != nil {
 			return nil, volumeErr
 		}
 
-		volumeMounts = append(volumeMounts, VolumeMount{
+		ioVolumeMounts = append(ioVolumeMounts, VolumeMount{
 			Volume:    outVolume,
-			MountPath: outputPath,
+			MountPath: outPath,
 		})
 	}
 
@@ -457,14 +473,15 @@ func (p *containerProvider) createGardenContainer(
 		}
 	}
 
-	volumeHandleMounts := map[string]string{}
+	sort.Sort(byMountPath(ioVolumeMounts))
+	volumeMounts = append(volumeMounts, ioVolumeMounts...)
+
 	for _, mount := range volumeMounts {
 		bindMounts = append(bindMounts, garden.BindMount{
 			SrcPath: mount.Volume.Path(),
 			DstPath: mount.MountPath,
 			Mode:    garden.BindMountModeRW,
 		})
-		volumeHandleMounts[mount.Volume.Handle()] = mount.MountPath
 	}
 
 	gardenProperties := garden.Properties{}
